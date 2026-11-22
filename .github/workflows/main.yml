@@ -2,15 +2,27 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      ANDROID_API_LEVEL: "36"
+      ANDROID_BUILD_TOOLS_VERSION: "36.0.0"
 
     steps:
       - name: Checkout repository
@@ -20,7 +32,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -28,37 +40,56 @@ jobs:
           packages: platform-tools
 
       - name: Install required Android SDK packages
+        shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+          # sdkmanager may close the pipe as soon as it has accepted all licenses.
+          # Ignore only yes's expected broken-pipe status, not sdkmanager failures.
+          ( set +o pipefail; yes | sdkmanager --licenses >/dev/null )
+
+          sdkmanager \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "platform-tools"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.11.1'
+          gradle-version: "8.11.1"
 
       - name: Extract Android project
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_ZIP="CodiX_VIP_Pro_Android_Project.zip"
-          if [ ! -s "$PROJECT_ZIP" ]; then
-            echo "ERROR: $PROJECT_ZIP is missing or empty in the repository root."
+          ALTERNATE_PROJECT_ZIP="CodiX_VIP_Pro_Android_Project(1).zip"
+
+          if [[ ! -s "$PROJECT_ZIP" && -s "$ALTERNATE_PROJECT_ZIP" ]]; then
+            PROJECT_ZIP="$ALTERNATE_PROJECT_ZIP"
+          fi
+
+          if [[ ! -s "$PROJECT_ZIP" ]]; then
+            echo "::error::Android project ZIP is missing or empty. Add CodiX_VIP_Pro_Android_Project.zip to the repository root."
             exit 1
           fi
 
           mkdir -p extracted-project
           unzip -q "$PROJECT_ZIP" -d extracted-project
-          SETTINGS_FILE=$(find extracted-project -maxdepth 5 -type f \
-            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ERROR: settings.gradle(.kts) was not found inside the project ZIP."
+
+          SETTINGS_FILE="$(find extracted-project -maxdepth 5 -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -print -quit)"
+
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "::error::settings.gradle or settings.gradle.kts was not found inside the project ZIP."
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
           cp -a "$PROJECT_DIR"/. .
+
           test -f app/src/main/assets/www/js/app.js
           test -f app/src/main/java/com/codix/vip/SecureStore.kt
           test -f app/src/main/java/com/codix/vip/NativeBridge.kt
@@ -67,9 +98,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           app = Path('app/src/main/assets/www/js/app.js').read_text(encoding='utf-8')
@@ -87,9 +118,29 @@ jobs:
                   raise SystemExit(f'MISSING END MARKER: {next_signature}')
               return source[start:end]
 
-          save_toggle = function_body(app, 'async function onSavePinToggle()', 'function getStoredBankPin(')
-          transfer = function_body(app, 'async function startTransfer()', 'function askAboutDialerEntry()')
-          account_editor = function_body(app, 'function openAccountSheet(', 'async function deleteAccount(')
+          save_toggle = function_body(
+              app,
+              'async function onSavePinToggle()',
+              'function getStoredBankPin(',
+          )
+          transfer = function_body(
+              app,
+              'async function startTransfer()',
+              'function askAboutDialerEntry()',
+          )
+          account_editor = function_body(
+              app,
+              'function openAccountSheet(',
+              'async function deleteAccount(',
+          )
+
+          save_pin_start = bridge.find('fun savePin(')
+          get_pin_start = bridge.find('fun getPin(')
+          bridge_save_pin = (
+              bridge[save_pin_start:get_pin_start]
+              if save_pin_start >= 0 and get_pin_start > save_pin_start
+              else ''
+          )
 
           checks = {
               'save flow does not request biometric authentication': 'N.auth(' not in save_toggle,
@@ -99,18 +150,22 @@ jobs:
               'one-time migration disables old default biometric-per-transfer setting': 'authPreferenceMigratedV2' in app,
               'PIN Keystore alias is version 2': 'codix_pin_v2' in secure,
               'PIN key does not require user authentication': 'setUserAuthenticationRequired(true)' not in secure and 'setUserAuthenticationParameters(' not in secure,
-              'native save PIN does not require device lock': 'if (!isDeviceSecure())' not in bridge[bridge.find('fun savePin('):bridge.find('fun getPin(')],
+              'native save PIN does not require device lock': 'if (!isDeviceSecure())' not in bridge_save_pin,
               'native JS supports encrypted PIN storage without screen lock': 'supported: function () { return !!B; }' in native_js,
               'backup export excludes per-account transfer PINs': 'delete copy.transferPin;' in store_js and 'delete safeAccount.transferPin;' in store_js,
           }
+
           for label, passed in checks.items():
               print(('PASS' if passed else 'FAIL') + ': ' + label)
+
           if not all(checks.values()):
               sys.exit('ERROR: one or more required source fixes are missing.')
           PY
 
       - name: Check JavaScript syntax
+        shell: bash
         run: |
+          set -euo pipefail
           node --check app/src/main/assets/www/js/app.js
           node --check app/src/main/assets/www/js/native.js
           node --check app/src/main/assets/www/js/providers.js
@@ -123,8 +178,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           APK="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "$APK"
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::The debug APK was not created."
+            exit 1
+          fi
+
           unzip -t "$APK" >/dev/null
           sha256sum "$APK"
           ls -lh "$APK"
