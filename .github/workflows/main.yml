@@ -5,16 +5,19 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
@@ -24,9 +27,10 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android SDK packages
+      - name: Install required Android SDK packages
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
       - name: Set up Gradle
@@ -34,483 +38,96 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Unzip and Patch Project
+      - name: Extract Android project
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ ! -f "CodiX_VIP_Pro_Android_Project.zip" ]; then
-            echo "ERROR: CodiX_VIP_Pro_Android_Project.zip was not found in repository root."
+          PROJECT_ZIP="CodiX_VIP_Pro_Android_Project.zip"
+          if [ ! -s "$PROJECT_ZIP" ]; then
+            echo "ERROR: $PROJECT_ZIP is missing or empty in the repository root."
             exit 1
           fi
 
-          unzip -o CodiX_VIP_Pro_Android_Project.zip
-
-          PROJECT_DIR=$(find . -maxdepth 4 -name "settings.gradle*" -print -quit | xargs -r dirname)
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: settings.gradle(.kts) was not found after extraction."
+          mkdir -p extracted-project
+          unzip -q "$PROJECT_ZIP" -d extracted-project
+          SETTINGS_FILE=$(find extracted-project -maxdepth 5 -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "ERROR: settings.gradle(.kts) was not found inside the project ZIP."
             exit 1
           fi
 
-          if [ "$PROJECT_DIR" != "." ]; then
-            cp -a "$PROJECT_DIR"/. .
-          fi
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          cp -a "$PROJECT_DIR"/. .
+          test -f app/src/main/assets/www/js/app.js
+          test -f app/src/main/java/com/codix/vip/SecureStore.kt
+          test -f app/src/main/java/com/codix/vip/NativeBridge.kt
 
-          if [ ! -f "app/src/main/assets/www/js/app.js" ]; then
-            echo "ERROR: Expected app.js was not found at app/src/main/assets/www/js/app.js."
-            find . -path "*/www/js/app.js" -print
-            exit 1
-          fi
-
-          python3 - << 'PY'
-          import glob
+      - name: Verify PIN security fixes are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
           import re
-          import subprocess
           import sys
-          
-          # --------------------------------------------------
-          # 1. Locate app.js
-          # --------------------------------------------------
-          
-          app_js_files = glob.glob("**/www/js/app.js", recursive=True)
-          
-          if not app_js_files:
-              sys.exit("ERROR: لم يتم العثور على ملف www/js/app.js")
-          
-          app_js_path = app_js_files[0]
-          
-          with open(app_js_path, "r", encoding="utf-8") as f:
-              js = f.read()
-          
-          # --------------------------------------------------
-          # 2. Update updatePinState safely (keep native security)
-          # --------------------------------------------------
-          
-          new_pin_state = """  function updatePinState() {
-              var prov = currentProv(), acc = currentAccount();
-              var key = pinKeyFor(prov, acc);
-              ui.hasSavedPin = N.available && N.pin.has(key);
-          
-              var cb = $('savePinCheckbox');
-              cb.checked = ui.hasSavedPin;
-          
-              var supported = N.available && N.pin.supported();
-              $('savePinWrap').style.display = N.available ? '' : 'none';
-              cb.disabled = N.available && !supported;
-          
-              var hint = '';
-              if (ui.hasSavedPin) {
-                hint = 'كلمة السر محفوظة ومشفرة بمفتاح الجهاز. اترك الحقل فارغًا لاستخدامها (تُطلب مصادقة الجهاز).';
-              } else if (N.available && !supported) {
-                hint = 'لحفظ كلمة السر يجب تفعيل قفل شاشة (بصمة أو رمز) على الجهاز.';
-              }
-          
-              if (acc && acc.transferPin) {
-                hint += (hint ? ' | ' : '') + '🔒 محمي برمز تحويل خاص.';
-              }
-          
-              $('pinHint').textContent = hint;
-              $('pin').placeholder = ui.hasSavedPin ? 'محفوظة' : '••••';
-            }"""
-          
-          js, count = re.subn(
-              r"(?ms)^  function updatePinState\(\) \{.*?^  \}",
-              lambda m: new_pin_state,
-              js,
-              count=1
-          )
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر العثور على دالة updatePinState واستبدالها.")
-          
-          # --------------------------------------------------
-          # 3. Add helper functions for custom transfer PIN
-          # --------------------------------------------------
-          
-          helper_code = r"""
-            function getStoredBankPin(prov, acc) {
-              var key = pinKeyFor(prov, acc);
-          
-              if (N.available) {
-                var r = N.pin.get(key);
-                if (r && r.ok && r.pin) return r.pin;
-              }
-          
-              return '';
-            }
-          
-            function verifyCustomTransferPin(prov, acc, typedBankPin) {
-              return new Promise(function (resolve) {
-                if (!acc || !acc.transferPin) {
-                  resolve(true);
-                  return;
-                }
-          
-                var done = false;
-          
-                function fin(value) {
-                  if (done) return;
-                  done = true;
-                  closeSheet();
-                  resolve(value);
-                }
-          
-                function showPinPrompt() {
-                  openSheet(function () {
-                    var inp = h('input', {
-                      class: 'field',
-                      type: 'password',
-                      inputmode: 'numeric',
-                      maxlength: '4',
-                      placeholder: '••••',
-                      style: 'text-align:center;font-size:22px;letter-spacing:8px'
-                    });
-          
-                    var err = h('div', { class: 'err-text' });
-          
-                    inp.addEventListener('input', function () {
-                      inp.value = inp.value.replace(/\D/g, '').slice(0, 4);
-                      err.textContent = '';
-                    });
-          
-                    var root = h('div', {},
-                      h('h2', { text: '🔒 تأكيد رمز التحويل' }),
-                      h('p', {
-                        text: 'أدخل رمز التحويل الخاص بحساب "' +
-                          accountLabel(acc) + '" (4 أرقام):'
-                      }),
-                      inp,
-                      err,
-                      h('div', { class: 'btn-row' },
-                        h('button', {
-                          class: 'btn',
-                          text: 'تأكيد التحويل',
-                          onclick: function () {
-                            if (inp.value === acc.transferPin) {
-                              fin(true);
-                            } else {
-                              err.textContent = 'رمز التحويل غير صحيح!';
-                              inp.value = '';
-                              inp.focus();
-                            }
-                          }
-                        }),
-                        h('button', {
-                          class: 'btn sec',
-                          text: 'إلغاء',
-                          onclick: function () { fin(false); }
-                        })
-                      ),
-                      h('div', { style: 'margin-top:12px;text-align:center' },
-                        h('button', {
-                          class: 'btn small sec',
-                          text: 'نسيت رمز التحويل؟ استعادة بكلمة مرور الحساب',
-                          onclick: showRecoveryPrompt
-                        })
-                      )
-                    );
-          
-                    setTimeout(function () { inp.focus(); }, 100);
-                    return root;
-                  });
-                }
-          
-                function showRecoveryPrompt() {
-                  // The bank PIN is only read from Android's protected PIN store
-                  // or from the PIN the user entered for this transaction.
-                  var realBankPin = getStoredBankPin(prov, acc) || typedBankPin || '';
-          
-                  openSheet(function () {
-                    var bankInp = h('input', {
-                      class: 'field',
-                      type: 'password',
-                      inputmode: 'numeric',
-                      maxlength: '4',
-                      placeholder: 'كلمة مرور الحساب البنكي (4 أرقام)',
-                      style: 'text-align:center;font-size:18px;letter-spacing:4px'
-                    });
-          
-                    var newPinInp = h('input', {
-                      class: 'field',
-                      type: 'password',
-                      inputmode: 'numeric',
-                      maxlength: '4',
-                      placeholder: 'رمز التحويل الجديد (أو اتركه فارغًا لإلغاء القفل)',
-                      style: 'text-align:center;font-size:18px;letter-spacing:4px'
-                    });
-          
-                    var err = h('div', { class: 'err-text' });
-          
-                    bankInp.addEventListener('input', function () {
-                      bankInp.value = bankInp.value.replace(/\D/g, '').slice(0, 4);
-                    });
-          
-                    newPinInp.addEventListener('input', function () {
-                      newPinInp.value = newPinInp.value.replace(/\D/g, '').slice(0, 4);
-                    });
-          
-                    return h('div', {},
-                      h('h2', { text: '🔑 استعادة رمز التحويل' }),
-                      h('p', {
-                        text: realBankPin
-                          ? 'أدخل كلمة مرور الحساب البنكي للتحقق من ملكيتك وتعيين رمز تحويل جديد:'
-                          : 'لا توجد كلمة مرور بنكية محفوظة أو مدخلة لهذا الحساب. أدخل كلمة مرور الحساب في الشاشة الرئيسية أولًا.'
-                      }),
-          
-                      realBankPin ? h('div', {},
-                        h('label', {
-                          class: 'f',
-                          text: 'كلمة مرور الحساب البنكي (مفتاح الاستعادة)'
-                        }),
-                        bankInp,
-                        h('label', {
-                          class: 'f',
-                          text: 'رمز التحويل الجديد (4 أرقام - اختياري)'
-                        }),
-                        newPinInp,
-                        err,
-                        h('div', { class: 'btn-row' },
-                          h('button', {
-                            class: 'btn',
-                            text: 'تحديث الرمز والمتابعة',
-                            onclick: function () {
-                              if (bankInp.value !== realBankPin) {
-                                err.textContent = 'كلمة مرور الحساب البنكي غير صحيحة!';
-                                return;
-                              }
-          
-                              if (newPinInp.value && !/^\d{4}$/.test(newPinInp.value)) {
-                                err.textContent =
-                                  'رمز التحويل الجديد يجب أن يكون 4 أرقام أو فارغًا لإلغائه';
-                                return;
-                              }
-          
-                              acc.transferPin = newPinInp.value || '';
-                              S.save();
-          
-                              toast(
-                                acc.transferPin
-                                  ? 'تم تحديث رمز التحويل بنجاح ✅'
-                                  : 'تم إلغاء رمز التحويل بنجاح ✅'
-                              );
-          
-                              fin(true);
-                            }
-                          }),
-                          h('button', {
-                            class: 'btn sec',
-                            text: 'رجوع',
-                            onclick: showPinPrompt
-                          })
-                        )
-                      ) : h('div', { class: 'btn-row' },
-                        h('button', {
-                          class: 'btn sec',
-                          text: 'رجوع',
-                          onclick: showPinPrompt
-                        })
-                      )
-                    );
-                  });
-                }
-          
-                showPinPrompt();
-              });
-            }
-          """
-          
-          transfer_marker = "  // ---------- تنفيذ التحويل ----------"
-          
-          if transfer_marker not in js:
-              sys.exit("ERROR: لم يتم العثور على موضع إدراج دوال حماية التحويل.")
-          
-          if "function getStoredBankPin(prov, acc)" not in js:
-              js = js.replace(transfer_marker, helper_code + "\n" + transfer_marker, 1)
-          
-          # --------------------------------------------------
-          # 4. Keep original Android authentication and add custom PIN check
-          # --------------------------------------------------
-          
-          new_transfer_auth = """    var usingSaved = prov.needsPin && !f.pin;
-              var pin = f.pin;
-          
-              if (N.available && (S.d.settings.requireAuth || usingSaved)) {
-                var a = await N.auth(
-                  prov.kind === 'login' ? 'تأكيد الدخول' : 'تأكيد التحويل',
-                  prov.kind === 'login'
-                    ? prov.label
-                    : (money(parseFloat(f.amount)) + ' إلى ' + f.phone)
-                );
-          
-                if (!a.ok && a.reason !== 'no_lock') {
-                  toast('تم إلغاء التحقق، لم تُنفَّذ العملية');
-                  return;
-                }
-          
-                if (a.reason === 'no_lock') {
-                  if (usingSaved) {
-                    toast('جهازك بلا قفل شاشة: أدخل كلمة السر يدويًا');
-                    return;
-                  }
-                  toast('تنبيه: جهازك بلا قفل شاشة، لا يمكن التحقق بالبصمة');
-                }
-              }
-          
-              if (usingSaved) {
-                var r = N.pin.get(pinKeyFor(prov, acc));
-          
-                if (!r.ok) {
-                  toast(
-                    r.reason === 'auth_required'
-                      ? 'انتهت صلاحية التحقق، أعد المحاولة'
-                      : 'تعذر قراءة كلمة السر المحفوظة، أدخلها يدويًا'
-                  );
-                  updatePinState();
-                  return;
-                }
-          
-                pin = r.pin;
-              }
-          
-              var customOk = await verifyCustomTransferPin(prov, acc, pin);
-          
-              if (!customOk) {
-                toast('تم إلغاء التحقق، لم تُنفَّذ العملية');
-                return;
-              }
-          
-          """
-          
-          js, count = re.subn(
-              r"(?ms)^    var usingSaved = prov\.needsPin && !f\.pin;.*?(?=^    var code = P\.buildCode\()",
-              lambda m: new_transfer_auth,
-              js,
-              count=1
-          )
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر العثور على كتلة التحقق داخل startTransfer.")
-          
-          # --------------------------------------------------
-          # 5. Add 4-digit transfer PIN field to account editor
-          # --------------------------------------------------
-          
-          account_field_pattern = (
-              r"(?m)^([ \t]*)var def = h\('input', "
-              r"\{ type: 'checkbox', id: 'accDefault' \}\);"
-          )
-          
-          account_field_replacement = r"""\1var tPin = h('input', {
-          \1  class: 'field',
-          \1  type: 'password',
-          \1  inputmode: 'numeric',
-          \1  maxlength: '4',
-          \1  'aria-label': 'رمز حماية التحويل',
-          \1  placeholder: '4 أرقام (اختياري - اتركه فارغًا بدون قفل)',
-          \1  style: 'direction:ltr;text-align:left'
-          \1});
-          \1tPin.value = acc && acc.transferPin ? acc.transferPin : '';
-          \1tPin.addEventListener('input', function () {
-          \1  tPin.value = tPin.value.replace(/\D/g, '').slice(0, 4);
-          \1});
-          \1var def = h('input', { type: 'checkbox', id: 'accDefault' });"""
-          
-          js, count = re.subn(
-              account_field_pattern,
-              lambda m: account_field_replacement.replace(r"\1", m.group(1)),
-              js,
-              count=1
-          )
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر إضافة حقل رمز التحويل داخل openAccountSheet.")
-          
-          # Add the field to the account editor UI.
-          ui_pattern = (
-              r"(?m)^([ \t]*)h\('label', "
-              r"\{ class: 'f', text: 'الشريحة في هذا الجهاز' \}\), sim,"
-          )
-          
-          def replace_account_ui(m):
-              indent = m.group(1)
-              return (
-                  indent + "h('label', { class: 'f', text: 'الشريحة في هذا الجهاز' }), sim,\n"
-                  + indent + "h('label', { class: 'f', text: '🔒 رمز حماية التحويل الخاص بهذا الحساب (4 أرقام - اختياري)' }), tPin,"
-              )
-          
-          js, count = re.subn(ui_pattern, replace_account_ui, js, count=1)
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر إضافة حقل رمز التحويل إلى واجهة الحساب.")
-          
-          # Add validation after the phone validation.
-          phone_validation = (
-              r"(?m)^([ \t]*)if \(p && !validPhone\(p\)\) "
-              r"\{ err\.textContent = 'رقم الخط يجب أن يتكون من 10 أرقام ويبدأ بـ 05'; return; \}"
-          )
-          
-          def replace_phone_validation(m):
-              indent = m.group(1)
-              return (
-                  m.group(0) + "\n"
-                  + indent + "if (tPin.value && !/^\\d{4}$/.test(tPin.value)) {\n"
-                  + indent + "  err.textContent = 'رمز حماية التحويل يجب أن يكون 4 أرقام دقيقة أو فارغًا';\n"
-                  + indent + "  return;\n"
-                  + indent + "}"
-              )
-          
-          js, count = re.subn(phone_validation, replace_phone_validation, js, count=1)
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر إضافة التحقق من طول رمز التحويل.")
-          
-          # Save the PIN in the account data (the app's data store is encrypted natively).
-          assign_pattern = (
-              r"(?m)^([ \t]*)o\.subId = sim\.value === '' \? null : parseInt\(sim\.value, 10\);"
-          )
-          
-          def replace_account_assign(m):
-              indent = m.group(1)
-              return (
-                  m.group(0) + "\n"
-                  + indent + "o.transferPin = tPin.value || '';"
-              )
-          
-          js, count = re.subn(assign_pattern, replace_account_assign, js, count=1)
-          
-          if count != 1:
-              sys.exit("ERROR: تعذر إضافة حفظ رمز التحويل ضمن بيانات الحساب.")
-          
-          # --------------------------------------------------
-          # 6. Write and syntax-check app.js
-          # --------------------------------------------------
-          
-          with open(app_js_path, "w", encoding="utf-8") as f:
-              f.write(js)
-          
-          check = subprocess.run(
-              ["node", "--check", app_js_path],
-              text=True,
-              capture_output=True
-          )
-          
-          if check.returncode != 0:
-              sys.stderr.write(check.stdout)
-              sys.stderr.write(check.stderr)
-              sys.exit("ERROR: فشل فحص صياغة JavaScript بعد التعديل.")
-          
-          print("SUCCESS: تم تعديل app.js وفحص صياغة JavaScript بنجاح.")
+
+          app = Path('app/src/main/assets/www/js/app.js').read_text(encoding='utf-8')
+          native_js = Path('app/src/main/assets/www/js/native.js').read_text(encoding='utf-8')
+          store_js = Path('app/src/main/assets/www/js/store.js').read_text(encoding='utf-8')
+          secure = Path('app/src/main/java/com/codix/vip/SecureStore.kt').read_text(encoding='utf-8')
+          bridge = Path('app/src/main/java/com/codix/vip/NativeBridge.kt').read_text(encoding='utf-8')
+
+          def function_body(source, signature, next_signature):
+              start = source.find(signature)
+              if start < 0:
+                  raise SystemExit(f'MISSING: {signature}')
+              end = source.find(next_signature, start + len(signature))
+              if end < 0:
+                  raise SystemExit(f'MISSING END MARKER: {next_signature}')
+              return source[start:end]
+
+          save_toggle = function_body(app, 'async function onSavePinToggle()', 'function getStoredBankPin(')
+          transfer = function_body(app, 'async function startTransfer()', 'function askAboutDialerEntry()')
+          account_editor = function_body(app, 'function openAccountSheet(', 'async function deleteAccount(')
+
+          checks = {
+              'save flow does not request biometric authentication': 'N.auth(' not in save_toggle,
+              'saved PIN is read through native encrypted storage': 'N.pin.get(pinKeyFor(prov, acc))' in transfer,
+              'transfer custom PIN verification exists': 'verifyCustomTransferPin(prov, acc, pin)' in transfer,
+              'per-account transfer PIN editor exists': 'transferPinInput' in account_editor and 'o.transferPin =' in account_editor,
+              'one-time migration disables old default biometric-per-transfer setting': 'authPreferenceMigratedV2' in app,
+              'PIN Keystore alias is version 2': 'codix_pin_v2' in secure,
+              'PIN key does not require user authentication': 'setUserAuthenticationRequired(true)' not in secure and 'setUserAuthenticationParameters(' not in secure,
+              'native save PIN does not require device lock': 'if (!isDeviceSecure())' not in bridge[bridge.find('fun savePin('):bridge.find('fun getPin(')],
+              'native JS supports encrypted PIN storage without screen lock': 'supported: function () { return !!B; }' in native_js,
+              'backup export excludes per-account transfer PINs': 'delete copy.transferPin;' in store_js and 'delete safeAccount.transferPin;' in store_js,
+          }
+          for label, passed in checks.items():
+              print(('PASS' if passed else 'FAIL') + ': ' + label)
+          if not all(checks.values()):
+              sys.exit('ERROR: one or more required source fixes are missing.')
           PY
 
-      - name: Build Debug APK
+      - name: Check JavaScript syntax
         run: |
-          gradle --no-daemon --stacktrace assembleDebug
+          node --check app/src/main/assets/www/js/app.js
+          node --check app/src/main/assets/www/js/native.js
+          node --check app/src/main/assets/www/js/providers.js
+          node --check app/src/main/assets/www/js/store.js
+
+      - name: Build Debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
 
       - name: Verify APK
+        shell: bash
         run: |
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          sha256sum "$APK"
+          ls -lh "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -518,3 +135,4 @@ jobs:
           name: CodixVIP-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
