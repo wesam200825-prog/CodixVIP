@@ -15,7 +15,10 @@ jobs:
       - name: Unzip project
         run: |
           unzip -o CodiX_VIP_Pro_Android_Project.zip
-          cp -r CodixVIP/* . || true
+          PROJECT_DIR=$(find . -maxdepth 3 -name "settings.gradle*" -exec dirname {} \; | head -n 1)
+          if [ "$PROJECT_DIR" != "." ] && [ -n "$PROJECT_DIR" ]; then
+            cp -r "$PROJECT_DIR"/* .
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -23,11 +26,14 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Build Debug APK
-        run: gradle assembleDebug
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug
+          else
+            gradle assembleDebug
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
